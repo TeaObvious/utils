@@ -3,12 +3,12 @@
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
-from shutil import which
 from collections import defaultdict
 from typing import Dict, List, Any, Optional, Tuple
+
+from exifclient import ExifClient
 
 RAW_EXTS = {"nef"}
 JPG_EXTS = {"jpg", "jpeg"}
@@ -34,102 +34,6 @@ JPG_TAGS = [
     "-LensID", "-LensModel", "-SerialNumber",
 ]
 
-# --------------------- exif helper class ---------------------
-
-class ExifClient:
-    def __init__(self, verbose: bool = False):
-        self.verbose = verbose
-        if which("exiftool") is None:
-            print("Fehler: 'exiftool' wurde nicht gefunden. Bitte installieren.", file=sys.stderr)
-            sys.exit(2)
-
-    def run_json(self, args: List[str]) -> List[Dict[str, Any]]:
-        cmd = ["exiftool", "-j", "-n", "-api", "RequestAll=3"] + args
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        out = proc.stdout.decode("utf-8", errors="replace")
-        return json.loads(out) if out.strip() else []
-
-    def read_single(self, path: Path, tags: List[str]) -> Optional[Dict[str, Any]]:
-        try:
-            data = self.run_json(tags + [str(path)])
-            return data[0] if data else None
-        except subprocess.CalledProcessError:
-            return None
-
-    def scan_tree(self, root: Path, wanted_exts: set, tags: List[str]) -> List[Dict[str, Any]]:
-        args = ["-r"]
-        for ext in sorted(wanted_exts):
-            args += ["-ext", ext]
-        args += tags + [str(root)]
-        return self.run_json(args)
-
-    def copy_gps(self, raw_path: Path, jpeg_path: Path, dry_run: bool = False) -> bool:
-        cmd = [
-            "exiftool", "-overwrite_original_in_place", "-m",
-            "-TagsFromFile", str(raw_path),
-            "-GPS:all",
-            str(jpeg_path),
-        ]
-        if dry_run:
-            print(f"[DRY-RUN] {' '.join(cmd)}")
-            return True
-        try:
-            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            if self.verbose:
-                sys.stdout.write(r.stdout.decode("utf-8", errors="replace"))
-                sys.stdout.write(r.stderr.decode("utf-8", errors="replace"))
-            return True
-        except subprocess.CalledProcessError as e:
-            sys.stderr.write(e.stdout.decode("utf-8", errors="replace"))
-            sys.stderr.write(e.stderr.decode("utf-8", errors="replace"))
-            return False
-
-    @staticmethod
-    def _has_offset(s: str) -> bool:
-        return (len(s) >= 6) and (s[-3] == ":") and (s[-6] in ["+", "-"])
-
-    @staticmethod
-    def _has_subsec(s: str) -> bool:
-        return "." in s
-
-    def compose_creation(self, metadata: Dict[str, Any]) -> Optional[str]:
-        create_date = metadata.get("CreateDate")
-        subsec_orig = metadata.get("SubSecTimeOriginal")
-        subsec_digi = metadata.get("SubSecTimeDigitized")
-        subsec_generic = metadata.get("SubSecTime")
-        offset_any = metadata.get("OffsetTimeDigitized") or metadata.get("OffsetTimeOriginal") or metadata.get("OffsetTime")
-
-        if create_date:
-            s = create_date
-            if not self._has_subsec(s):
-                sub = subsec_digi or subsec_orig or subsec_generic
-                if sub is not None and sub != "":
-                    s = f"{s}.{sub}"
-            if not self._has_offset(s) and offset_any:
-                s = f"{s}{offset_any}"
-            return s
-
-        date_created = metadata.get("DateCreated")
-        time_created = metadata.get("TimeCreated")
-        if date_created and time_created:
-            s = f"{date_created} {time_created}"
-            sub = subsec_generic or subsec_digi or subsec_orig
-            if sub is not None and sub != "" and not self._has_subsec(s):
-                s = f"{s}.{sub}"
-            if not self._has_offset(s) and offset_any:
-                s = f"{s}{offset_any}"
-            return s
-
-        return None
-
-    @staticmethod
-    def to_int(value) -> Optional[int]:
-        try:
-            if value is None:
-                return None
-            return int(str(value).strip())
-        except Exception:
-            return None
 
 # --------------------- on-demand Referenz-Lookup ---------------------
 
@@ -206,7 +110,7 @@ class GPSCopier:
             print(f"Fehler: Referenz-Ordner nicht gefunden: {self.ref_root}", file=sys.stderr)
             sys.exit(2)
 
-        self.exif = ExifClient(verbose=self.verbose)
+        self.exif = ExifClient(verbose=self.verbose, parallel=False)
         self.ref_lookup = RefLookup(self.exif, self.ref_root, verbose=self.verbose)
 
         self.by_creation: Dict[str, List[Dict[str, Any]]] = {}
@@ -248,12 +152,8 @@ class GPSCopier:
         by_basename: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
         for metadata in raw_metadata_list:
-            shutter_count = self.exif.to_int(metadata.get("ShutterCount"))
-            if shutter_count is None:
-                shutter_count = self.exif.to_int(metadata.get("MechanicalShutterCount"))
+            shutter_count = self.exif.extract_shuttercount(metadata)
             image_number = self.exif.to_int(metadata.get("ImageNumber"))
-            if shutter_count is None and image_number is not None:
-                shutter_count = image_number
 
             entry = {
                 "path": Path(metadata["SourceFile"]),
@@ -262,8 +162,8 @@ class GPSCopier:
                 "MechanicalShutterCount": self.exif.to_int(metadata.get("MechanicalShutterCount")),
                 "ImageNumber": image_number,
                 "FileNumber": self.exif.to_int(metadata.get("FileNumber")),
-                "SerialNumber": metadata.get("SerialNumber"),
-                "LensID": metadata.get("LensID") or metadata.get("LensModel"),
+                "SerialNumber": self.exif.extract_camera(metadata),
+                "LensID": self.exif.extract_lens(metadata),
             }
 
             if entry["CreateKey"]:
@@ -302,11 +202,11 @@ class GPSCopier:
             return candidates
 
         # Quelle für Vergleichswerte: JPEG selbst → Referenz (falls vorhanden)
-        jpeg_serial = jpeg_meta.get("SerialNumber")
-        jpeg_lens = jpeg_meta.get("LensID") or jpeg_meta.get("LensModel")
+        jpeg_serial = self.exif.extract_camera(jpeg_meta)
+        jpeg_lens = self.exif.extract_lens(jpeg_meta)
 
-        ref_serial = ref_meta.get("SerialNumber") if ref_meta else None
-        ref_lens = (ref_meta.get("LensID") or ref_meta.get("LensModel")) if ref_meta else None
+        ref_serial = self.exif.extract_camera(ref_meta) if ref_meta else None
+        ref_lens = self.exif.extract_lens(ref_meta) if ref_meta else None
 
         want_serial = jpeg_serial or ref_serial
         want_lens = jpeg_lens or ref_lens

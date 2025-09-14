@@ -1,84 +1,9 @@
 #!/usr/bin/env python3
 import argparse
-import subprocess
-import json
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import shutil
-import re
 
-
-class ExifClient:
-    """Wrapper around exiftool (sync or parallel)."""
-
-    def __init__(self, parallel: bool = True, workers: int = 16, verbose: bool = False):
-        self.parallel = parallel
-        self.workers = workers
-        self.verbose = verbose
-
-    def _run_exiftool_json(self, path: Path) -> dict:
-        cmd = ["exiftool", "-json", "-api", "RequestAll=3", str(path)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            return {"SourceFile": str(path), "error": proc.stderr.strip()}
-        try:
-            data = json.loads(proc.stdout)
-            return data[0] if data else {"SourceFile": str(path), "error": "No data"}
-        except json.JSONDecodeError:
-            return {"SourceFile": str(path), "error": "Invalid JSON"}
-
-    def _read_parallel(self, files: list[Path]) -> list[dict]:
-        results = []
-        with ProcessPoolExecutor(max_workers=self.workers) as pool:
-            future_to_file = {pool.submit(self._run_exiftool_json, f): f for f in files}
-            for future in as_completed(future_to_file):
-                try:
-                    results.append(future.result())
-                except Exception as e:
-                    results.append({"SourceFile": str(future_to_file[future]), "error": str(e)})
-        return results
-
-    def _read_sync(self, files: list[Path]) -> list[dict]:
-        return [self._run_exiftool_json(f) for f in files]
-
-    def read(self, files: list[Path]) -> list[dict]:
-        """Main entry: sync or parallel"""
-        if self.verbose:
-            mode = "parallel" if self.parallel else "sync"
-            print(f"[INFO] Reading {len(files)} files with exiftool ({mode}, workers={self.workers}) …")
-        if self.parallel:
-            return self._read_parallel(files)
-        return self._read_sync(files)
-
-
-def sanitize_filename(name: str) -> str:
-    """Replace unsafe characters with underscore."""
-    return re.sub(r'[^A-Za-z0-9._-]', '_', name)
-
-
-def extract_datetime(meta: dict) -> str | None:
-    """Extract datetime string in YYYYMMDD_HHMMSS_mmmm format (4-digit millis)."""
-    dt = (
-        meta.get("CreateDate")
-        or meta.get("DateTimeOriginal")
-        or meta.get("DateTimeCreated")
-    )
-    subsec = (
-        meta.get("SubSecTimeOriginal")
-        or meta.get("SubSecTime")
-        or meta.get("SubSecDateTimeOriginal")
-    )
-
-    if not dt:
-        return None
-
-    # Normalize: 2025:08:28 16:08:34 → 20250828_160834
-    dt = dt.strip().replace(":", "").replace(" ", "_")
-
-    if subsec:
-        subsec = str(subsec).zfill(4)[:4]  # always 4 digits
-        return f"{dt}_{subsec}"
-    return dt
+from exifclient import ExifClient, sanitize_filename, extract_datetime
 
 
 def main():
